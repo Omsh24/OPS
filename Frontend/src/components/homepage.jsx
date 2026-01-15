@@ -1,39 +1,54 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useSocket } from '../context/SocketContext'
 import './homepage.css'
 
 function HomePage() {
   const navigate = useNavigate()
+  const { socketService, setRoomData, players, setPlayers } = useSocket()
   const [hoveredButton, setHoveredButton] = useState(null)
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [showJoinModal, setShowJoinModal] = useState(false)
   const [roomId, setRoomId] = useState('')
   const [isFetchingRoomId, setIsFetchingRoomId] = useState(false)
-  const [joinedUsers, setJoinedUsers] = useState([])
   const [joinRoomIdInput, setJoinRoomIdInput] = useState('')
   const [copied, setCopied] = useState(false)
+  const [error, setError] = useState('')
+  const [playerName, setPlayerName] = useState('')
 
-  // Generate a random room ID (in real app, this would come from backend)
-  const generateRoomId = () => {
-    return Math.random().toString(36).substring(2, 8).toUpperCase()
-  }
+  const handleCreateRoom = async () => {
+    if (!playerName.trim()) {
+      setError('Please enter your name');
+      return;
+    }
 
-  const handleCreateRoom = () => {
     setShowCreateModal(true)
     setIsFetchingRoomId(true)
-    setJoinedUsers(['You']) // Add creator as first user
+    setError('')
     
-    // Simulate fetching room ID
-    setTimeout(() => {
-      const newRoomId = generateRoomId()
-      setRoomId(newRoomId)
+    try {
+      // Create room via socket
+      const data = await socketService.createRoom(playerName.trim(), 9)
+      console.log('Room created:', data)
+      setRoomId(data.roomCode)
+      setRoomData(data.room)
+      setPlayers(data.room.players)
       setIsFetchingRoomId(false)
-    }, 1500)
+    } catch (err) {
+      console.error('Error creating room:', err)
+      setError('Failed to create room. Please try again.')
+      setIsFetchingRoomId(false)
+      setShowCreateModal(false)
+    }
   }
 
   const handleJoinRoom = () => {
+    if (!playerName.trim()) {
+      setError('Please enter your name');
+      return;
+    }
     setShowJoinModal(true)
-    setJoinedUsers([])
+    setError('')
   }
 
   const handleCopyRoomId = async () => {
@@ -46,28 +61,56 @@ function HomePage() {
     }
   }
 
-  const handleJoinRoomSubmit = () => {
+  const handleJoinRoomSubmit = async () => {
     if (!joinRoomIdInput.trim()) {
-      alert('Please enter a room ID')
+      setError('Please enter a room ID')
       return
     }
     
-    // Simulate joining room and fetching users
-    setJoinedUsers(['User1', 'User2', 'You'])
-    // In real app, you would validate the room ID and fetch users from backend
+    if (!playerName.trim()) {
+      setError('Please enter your name')
+      return
+    }
+
+    setError('')
+    
+    try {
+      // Join room via socket
+      const data = await socketService.joinRoom(joinRoomIdInput.trim(), playerName.trim())
+      console.log('Joined room:', data)
+      setRoomId(data.roomCode)
+      setRoomData(data.room)
+      setPlayers(data.room.players)
+    } catch (err) {
+      console.error('Error joining room:', err)
+      setError(err.message || 'Failed to join room. Please check the room ID.')
+    }
   }
 
   const handleEnterGame = () => {
     navigate('/startgame')
   }
 
+  const handleStartGame = () => {
+    // Host starts the game
+    socketService.startGame()
+    // Game started event will be handled in SocketContext
+    // which will trigger navigation via the useEffect in this component or globally
+  }
+
   const closeModal = () => {
+    // Leave room when closing modal
+    if (roomId) {
+      socketService.leaveRoom()
+    }
     setShowCreateModal(false)
     setShowJoinModal(false)
     setRoomId('')
     setJoinRoomIdInput('')
-    setJoinedUsers([])
+    setPlayers([])
     setIsFetchingRoomId(false)
+    setError('')
+    setRoomData(null)
   }
 
   return (
@@ -93,6 +136,20 @@ function HomePage() {
           </h1>
           <p className="game-subtitle">Navigate through the labyrinth</p>
         </div>
+
+        {/* Player Name Input */}
+        <div className="name-input-section">
+          <input
+            type="text"
+            className="player-name-input"
+            placeholder="Enter your name"
+            value={playerName}
+            onChange={(e) => setPlayerName(e.target.value)}
+            maxLength={20}
+          />
+        </div>
+
+        {error && <div className="error-message">{error}</div>}
 
         <div className="button-container">
           <button
@@ -159,20 +216,28 @@ function HomePage() {
                 </div>
 
                 <div className="users-section">
-                  <h3 className="users-title">Joined Users ({joinedUsers.length})</h3>
+                  <h3 className="users-title">Joined Users ({players.length})</h3>
                   <div className="users-list">
-                    {joinedUsers.map((user, index) => (
+                    {players.map((player, index) => (
                       <div key={index} className="user-item">
                         <span className="user-avatar">👤</span>
-                        <span className="user-name">{user}</span>
+                        <span className="user-name">
+                          {player.name} {player.isHost && '(Host)'}
+                        </span>
                       </div>
                     ))}
                   </div>
                 </div>
 
-                <button className="enter-game-button" onClick={handleEnterGame}>
-                  Enter Game
-                </button>
+                {players.length > 0 && players[0].isHost && players[0].id === socketService.getSocket()?.id && (
+                  <button className="enter-game-button" onClick={handleStartGame}>
+                    Start Game
+                  </button>
+                )}
+                
+                {!(players.length > 0 && players[0].isHost && players[0].id === socketService.getSocket()?.id) && (
+                  <div className="waiting-message">Waiting for host to start the game...</div>
+                )}
               </>
             )}
           </div>
@@ -204,24 +269,32 @@ function HomePage() {
               </button>
             </div>
 
-            {joinedUsers.length > 0 && (
-              <div className="users-section">
-                <h3 className="users-title">Current Users ({joinedUsers.length})</h3>
-                <div className="users-list">
-                  {joinedUsers.map((user, index) => (
-                    <div key={index} className="user-item">
-                      <span className="user-avatar">👤</span>
-                      <span className="user-name">{user}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
+            {error && <div className="error-message">{error}</div>}
 
-            {joinedUsers.length > 0 && (
-              <button className="enter-game-button" onClick={handleEnterGame}>
-                Enter Game
-              </button>
+            {players.length > 0 && (
+              <>
+                <div className="users-section">
+                  <h3 className="users-title">Current Users ({players.length})</h3>
+                  <div className="users-list">
+                    {players.map((player, index) => (
+                      <div key={index} className="user-item">
+                        <span className="user-avatar">👤</span>
+                        <span className="user-name">
+                          {player.name} {player.isHost && '(Host)'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {players[0].isHost && players[0].id === socketService.getSocket()?.id ? (
+                  <button className="enter-game-button" onClick={handleStartGame}>
+                    Start Game
+                  </button>
+                ) : (
+                  <div className="waiting-message">Waiting for host to start the game...</div>
+                )}
+              </>
             )}
           </div>
         </div>

@@ -1,12 +1,19 @@
 import { useState, useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useSocket } from '../context/SocketContext'
 import '../App.css'
 import { maze, MAZE_ROWS, MAZE_COLS, isWall } from '../maze'
 
 function StartGame() {
+  const navigate = useNavigate()
+  const { socketService, roomData, gameState } = useSocket()
+  
   // Player starting position (row 1, col 1 is an empty space)
   const [playerPos, setPlayerPos] = useState({ row: 1, col: 1 })
   const [playerPixelPos, setPlayerPixelPos] = useState({ x: 0, y: 0 })
   const [direction, setDirection] = useState(null) // null, 'up', 'down', 'left', 'right'
+  const [remotePlayers, setRemotePlayers] = useState({}) // { playerId: { x, y, name } }
+  
   const directionRef = useRef(null)
   const playerPixelPosRef = useRef({ x: 0, y: 0 })
   const targetGridPosRef = useRef({ row: 1, col: 1 })
@@ -16,6 +23,93 @@ function StartGame() {
   const mazeContainerRef = useRef(null)
   const pendingDirectionRef = useRef(null) // Store pending direction change
   const lastFrameTimeRef = useRef(null) // Track time for smooth animation
+  const lastPositionSentRef = useRef({ row: 1, col: 1 }) // Track last sent position
+
+  // Check if we're in a game
+  useEffect(() => {
+    if (!roomData || !gameState) {
+      console.log('No room or game state, redirecting to home')
+      // navigate('/')
+    }
+  }, [roomData, gameState, navigate])
+
+  // Setup socket listeners for multiplayer
+  useEffect(() => {
+    // Listen for position updates from other players
+    const handlePositionUpdate = (data) => {
+      const { playerId, position } = data
+      
+      // Don't update our own position
+      if (playerId === socketService.getSocket()?.id) return
+      
+      // Update remote player position
+      setRemotePlayers(prev => {
+        const player = roomData?.players?.find(p => p.id === playerId)
+        return {
+          ...prev,
+          [playerId]: {
+            x: position.x,
+            y: position.y,
+            name: player?.name || 'Player',
+            timestamp: Date.now()
+          }
+        }
+      })
+    }
+
+    // Listen for game state sync (initial positions)
+    const handleGameStateSync = (data) => {
+      if (data.gameState && data.gameState.players) {
+        const newRemotePlayers = {}
+        data.gameState.players.forEach(player => {
+          if (player.id !== socketService.getSocket()?.id && player.position) {
+            newRemotePlayers[player.id] = {
+              x: player.position.x,
+              y: player.position.y,
+              name: player.name
+            }
+          }
+        })
+        setRemotePlayers(newRemotePlayers)
+      }
+    }
+
+    // Listen for game started event
+    const handleGameStarted = () => {
+      console.log('Game started!')
+      // Request initial game state
+      socketService.getGameState()
+    }
+
+    socketService.onPlayerPositionUpdate(handlePositionUpdate)
+    socketService.onGameStateSync(handleGameStateSync)
+    socketService.onGameStarted(handleGameStarted)
+
+    // Request initial game state
+    socketService.getGameState()
+
+    // Cleanup
+    return () => {
+      socketService.off('player_position_update', handlePositionUpdate)
+      socketService.off('game_state_sync', handleGameStateSync)
+      socketService.off('game_started', handleGameStarted)
+    }
+  }, [socketService, roomData])
+
+  // Send position updates to server
+  const sendPositionUpdate = (gridRow, gridCol) => {
+    // Only send if position changed significantly
+    if (gridRow !== lastPositionSentRef.current.row || 
+        gridCol !== lastPositionSentRef.current.col) {
+      
+      const cellSize = Math.min(window.innerWidth / MAZE_COLS, window.innerHeight / MAZE_ROWS)
+      const x = gridCol * cellSize + cellSize / 2
+      const y = gridRow * cellSize + cellSize / 2
+      
+      socketService.updatePosition({ x, y })
+      lastPositionSentRef.current = { row: gridRow, col: gridCol }
+    }
+  }
 
   // Keep directionRef in sync with direction state
   useEffect(() => {
@@ -36,6 +130,11 @@ function StartGame() {
         newDirection = 'left'
       } else if (key === 'arrowright' || key === 'd') {
         newDirection = 'right'
+      } else if (key === 'escape') {
+        // Leave game
+        socketService.leaveRoom()
+        navigate('/')
+        return
       }
 
       if (newDirection) {
@@ -87,7 +186,7 @@ function StartGame() {
 
     window.addEventListener('keydown', handleKeyPress)
     return () => window.removeEventListener('keydown', handleKeyPress)
-  }, [])
+  }, [navigate, socketService])
 
   // Game loop for continuous movement (grid position updates)
   useEffect(() => {
@@ -120,6 +219,8 @@ function StartGame() {
         // Check if the new position is valid (not a wall)
         if (!isWall(newRow, newCol)) {
           targetGridPosRef.current = { row: newRow, col: newCol }
+          // Send position update to server
+          sendPositionUpdate(newRow, newCol)
           return { row: newRow, col: newCol }
         }
         // If it's a wall, stop moving (don't change position)
@@ -159,28 +260,20 @@ function StartGame() {
       const distance = Math.sqrt(dx * dx + dy * dy)
       
       // Use time-based interpolation for consistent smoothness
-      // Calculate velocity needed to reach target smoothly
       if (distance > 0.1) {
-        // Calculate the speed (pixels per millisecond) needed to reach target
-        // We want to move at a rate that completes the cell movement in moveSpeed ms
         const pixelsPerMs = cellSize / moveSpeed
-        
-        // Calculate how much to move this frame based on time delta
         const moveAmount = pixelsPerMs * deltaTime
         
         // Move towards target, but don't overshoot
         if (moveAmount >= distance) {
-          // Close enough, snap to target
           current.x = targetX
           current.y = targetY
         } else {
-          // Move proportionally towards target
           const ratio = moveAmount / distance
           current.x += dx * ratio
           current.y += dy * ratio
         }
       } else {
-        // Snap to target when very close
         current.x = targetX
         current.y = targetY
       }
@@ -193,7 +286,6 @@ function StartGame() {
         const isAligned = dx < threshold && dy < threshold
         
         if (isAligned) {
-          // Apply the pending direction change
           setDirection(pendingDirectionRef.current)
           pendingDirectionRef.current = null
         }
@@ -212,7 +304,7 @@ function StartGame() {
     playerPixelPosRef.current = { x: initialX, y: initialY }
     targetGridPosRef.current = { row: playerPos.row, col: playerPos.col }
     setPlayerPixelPos({ x: initialX, y: initialY })
-    lastFrameTimeRef.current = null // Reset frame time
+    lastFrameTimeRef.current = null
     
     animationFrameRef.current = requestAnimationFrame(animate)
     
@@ -244,6 +336,19 @@ function StartGame() {
 
   return (
     <div className="game-container">
+      {/* Game Info HUD */}
+      <div className="game-hud">
+        <div className="hud-item">
+          Room: {roomData?.code || 'N/A'}
+        </div>
+        <div className="hud-item">
+          Players: {Object.keys(remotePlayers).length + 1}
+        </div>
+        <div className="hud-item">
+          Press ESC to leave
+        </div>
+      </div>
+
       <div className="maze-container" ref={mazeContainerRef}>
         {maze.map((row, rowIndex) => (
           <div key={rowIndex} className="maze-row">
@@ -255,15 +360,46 @@ function StartGame() {
             ))}
           </div>
         ))}
+        
+        {/* Local Player */}
         <div
           ref={playerRef}
-          className="player"
+          className="player local-player"
           style={{
             left: `${playerLeftPercent}%`,
             top: `${playerTopPercent}%`,
-            transform: 'translate(-50%, -50%)', // Center the player on the position
+            transform: 'translate(-50%, -50%)',
           }}
         />
+
+        {/* Remote Players */}
+        {Object.entries(remotePlayers).map(([playerId, player]) => {
+          const remoteLeftPercent = (player.x / mazeWidth) * 100
+          const remoteTopPercent = (player.y / mazeHeight) * 100
+          
+          return (
+            <div key={playerId}>
+              <div
+                className="player remote-player"
+                style={{
+                  left: `${remoteLeftPercent}%`,
+                  top: `${remoteTopPercent}%`,
+                  transform: 'translate(-50%, -50%)',
+                }}
+              />
+              <div
+                className="player-name"
+                style={{
+                  left: `${remoteLeftPercent}%`,
+                  top: `${remoteTopPercent}%`,
+                  transform: 'translate(-50%, calc(-100% - 10px))',
+                }}
+              >
+                {player.name}
+              </div>
+            </div>
+          )
+        })}
       </div>
     </div>
   )

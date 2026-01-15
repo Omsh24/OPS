@@ -67,3 +67,71 @@ body, html {
   will-change: transform, left, top;
   box-shadow: 0 0 10px rgba(255, 235, 59, 0.5);
 }
+
+.local-player {
+  background-color: #ffeb3b;
+  box-shadow: 0 0 15px rgba(255, 235, 59, 0.8), 0 0 30px rgba(255, 235, 59, 0.4);
+}
+
+.remote-player {
+  background-color: #4CAF50;
+  box-shadow: 0 0 10px rgba(76, 175, 80, 0.5);
+}
+
+.player-name {
+  position: absolute;
+  color: white;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 11;
+  background: rgba(0, 0, 0, 0.6);
+  padding: 0.2rem 0.5rem;
+  border-radius: 8px;
+  backdrop-filter: blur(5px);
+}
+
+/* Game HUD */
+.game-hud {
+  position: fixed;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 1rem;
+  z-index: 100;
+  background: rgba(53, 6, 62, 0.9);
+  padding: 1rem 2rem;
+  border-radius: 15px;
+  backdrop-filter: blur(10px);
+  border: 2px solid rgba(128, 0, 128, 0.4);
+  box-shadow: 0 5px 20px rgba(0, 0, 0, 0.5);
+}
+
+.hud-item {
+  color: white;
+  font-size: 1rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0 1rem;
+  border-left: 2px solid rgba(128, 0, 128, 0.5);
+}
+
+.hud-item:first-child {
+  border-left: none;
+}
+
+@media (max-width: 768px) {
+  .game-hud {
+    padding: 0.75rem 1rem;
+    gap: 0.5rem;
+  }
+  
+  .hud-item {
+    font-size: 0.8rem;
+    padding: 0 0.5rem;
+  }
+}
