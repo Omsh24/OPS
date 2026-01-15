@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useSocket } from '../context/SocketContext'
 import '../App.css'
-import { maze, MAZE_ROWS, MAZE_COLS, isWall } from '../maze'
+import { maze, MAZE_ROWS, MAZE_COLS, isWall, hasWrapAround, getWrappedCol } from '../maze'
 
 function StartGame() {
   const navigate = useNavigate()
@@ -13,6 +13,7 @@ function StartGame() {
   const [playerPixelPos, setPlayerPixelPos] = useState({ x: 0, y: 0 })
   const [direction, setDirection] = useState(null) // null, 'up', 'down', 'left', 'right'
   const [remotePlayers, setRemotePlayers] = useState({}) // { playerId: { x, y, name } }
+  const [remotePlayerPixelPos, setRemotePlayerPixelPos] = useState({}) // { playerId: { x, y } }
   
   const directionRef = useRef(null)
   const playerPixelPosRef = useRef({ x: 0, y: 0 })
@@ -24,6 +25,9 @@ function StartGame() {
   const pendingDirectionRef = useRef(null) // Store pending direction change
   const lastFrameTimeRef = useRef(null) // Track time for smooth animation
   const lastPositionSentRef = useRef({ row: 1, col: 1 }) // Track last sent position
+  const lastGridPosRef = useRef({ row: 1, col: 1 }) // Track last grid position to detect wraps
+  const remotePlayerPositionsRef = useRef({}) // { playerId: { current: {x,y}, target: {x,y}, row, col } }
+  const lastPositionUpdateTimeRef = useRef(0) // Track when we last sent position update
 
   // Check if we're in a game
   useEffect(() => {
@@ -42,25 +46,118 @@ function StartGame() {
       // Don't update our own position
       if (playerId === socketService.getSocket()?.id) return
       
-      // Update remote player position
+      // Update remote player target position for smooth interpolation
+      const player = roomData?.players?.find(p => p.id === playerId)
+      const playerName = player?.name || 'Player'
+      
       setRemotePlayers(prev => {
-        const player = roomData?.players?.find(p => p.id === playerId)
+        const existing = prev[playerId]
         return {
           ...prev,
           [playerId]: {
             x: position.x,
             y: position.y,
-            name: player?.name || 'Player',
+            name: playerName,
             timestamp: Date.now()
           }
         }
       })
+      
+      // Update target position for smooth interpolation
+      if (!remotePlayerPositionsRef.current[playerId]) {
+        // Initialize both current and target to the same position
+        remotePlayerPositionsRef.current[playerId] = {
+          current: { x: position.x, y: position.y },
+          target: { x: position.x, y: position.y },
+          row: position.row || 1,
+          col: position.col || 1,
+          lastCol: position.col || 1
+        }
+        setRemotePlayerPixelPos(prev => ({
+          ...prev,
+          [playerId]: { x: position.x, y: position.y }
+        }))
+      } else {
+        const playerPos = remotePlayerPositionsRef.current[playerId]
+        const lastCol = playerPos.lastCol || playerPos.col
+        const newCol = position.col || playerPos.col
+        const newRow = position.row || playerPos.row
+        
+        // Detect wrap-around for remote players
+        const cellSize = Math.min(window.innerWidth / MAZE_COLS, window.innerHeight / MAZE_ROWS)
+        const mazeWidth = cellSize * MAZE_COLS
+        let adjustedTargetX = position.x
+        let wrapDetected = false
+        
+        if (hasWrapAround(newRow) && hasWrapAround(playerPos.row)) {
+          const colDiff = newCol - lastCol
+          
+          // Detect wrap from right to left (31 -> 0)
+          if (colDiff < -MAZE_COLS / 2 || (lastCol === MAZE_COLS - 1 && newCol === 0)) {
+            wrapDetected = true
+            // Snap current position to wrapped side (right side) immediately
+            // This prevents gliding across the screen
+            if (playerPos.current.x < mazeWidth / 2) {
+              // Current is on left, target is on right after wrap
+              // Snap current to right side near target
+              playerPos.current.x = position.x + mazeWidth
+              adjustedTargetX = position.x + mazeWidth
+            } else {
+              // Already on right side, just update target
+              adjustedTargetX = position.x + mazeWidth
+            }
+          }
+          // Detect wrap from left to right (0 -> 31)
+          else if (colDiff > MAZE_COLS / 2 || (lastCol === 0 && newCol === MAZE_COLS - 1)) {
+            wrapDetected = true
+            // Snap current position to wrapped side (left side) immediately
+            // This prevents gliding across the screen
+            if (playerPos.current.x > mazeWidth / 2) {
+              // Current is on right, target is on left after wrap
+              // Snap current to left side near target
+              playerPos.current.x = position.x - mazeWidth
+              adjustedTargetX = position.x - mazeWidth
+            } else {
+              // Already on left side, just update target
+              adjustedTargetX = position.x - mazeWidth
+            }
+          }
+        }
+        
+        // If no wrap detected, normalize positions to ensure they're in valid range
+        if (!wrapDetected && hasWrapAround(newRow)) {
+          // Normalize target to 0-mazeWidth range
+          while (adjustedTargetX < 0) {
+            adjustedTargetX += mazeWidth
+          }
+          while (adjustedTargetX >= mazeWidth) {
+            adjustedTargetX -= mazeWidth
+          }
+        }
+        
+        // Update target position
+        playerPos.target = { x: adjustedTargetX, y: position.y }
+        playerPos.row = newRow
+        playerPos.col = newCol
+        playerPos.lastCol = newCol
+        
+        // If wrap was detected, immediately update the pixel position to prevent gliding
+        if (wrapDetected) {
+          setRemotePlayerPixelPos(prev => ({
+            ...prev,
+            [playerId]: { x: playerPos.current.x, y: playerPos.current.y }
+          }))
+        }
+      }
     }
 
     // Listen for game state sync (initial positions)
     const handleGameStateSync = (data) => {
       if (data.gameState && data.gameState.players) {
         const newRemotePlayers = {}
+        const newRemotePixelPos = {}
+        const newRemotePositions = {}
+        
         data.gameState.players.forEach(player => {
           if (player.id !== socketService.getSocket()?.id && player.position) {
             newRemotePlayers[player.id] = {
@@ -68,9 +165,22 @@ function StartGame() {
               y: player.position.y,
               name: player.name
             }
+            newRemotePixelPos[player.id] = {
+              x: player.position.x,
+              y: player.position.y
+            }
+            newRemotePositions[player.id] = {
+              current: { x: player.position.x, y: player.position.y },
+              target: { x: player.position.x, y: player.position.y },
+              row: player.position.row || 1,
+              col: player.position.col || 1,
+              lastCol: player.position.col || 1
+            }
           }
         })
         setRemotePlayers(newRemotePlayers)
+        setRemotePlayerPixelPos(newRemotePixelPos)
+        remotePlayerPositionsRef.current = newRemotePositions
       }
     }
 
@@ -88,26 +198,69 @@ function StartGame() {
     // Request initial game state
     socketService.getGameState()
 
+    // Listen for player leaving to clean up their data
+    const handlePlayerLeft = (data) => {
+      const { playerId } = data
+      setRemotePlayers(prev => {
+        const updated = { ...prev }
+        delete updated[playerId]
+        return updated
+      })
+      setRemotePlayerPixelPos(prev => {
+        const updated = { ...prev }
+        delete updated[playerId]
+        return updated
+      })
+      delete remotePlayerPositionsRef.current[playerId]
+    }
+
+    socketService.onPlayerLeft(handlePlayerLeft)
+
     // Cleanup
     return () => {
       socketService.off('player_position_update', handlePositionUpdate)
       socketService.off('game_state_sync', handleGameStateSync)
       socketService.off('game_started', handleGameStarted)
+      socketService.off('player_left', handlePlayerLeft)
     }
   }, [socketService, roomData])
 
-  // Send position updates to server
-  const sendPositionUpdate = (gridRow, gridCol) => {
-    // Only send if position changed significantly
-    if (gridRow !== lastPositionSentRef.current.row || 
-        gridCol !== lastPositionSentRef.current.col) {
+  // Send position updates to server (more frequently for smoother remote player movement)
+  const sendPositionUpdate = (pixelX, pixelY) => {
+    const now = Date.now()
+    // Send updates every 33ms (~30 times per second) for very smooth remote player movement
+    if (now - lastPositionUpdateTimeRef.current > 33) {
+      const currentGridPos = targetGridPosRef.current
+      const lastGridPos = lastGridPosRef.current
       
+      // Detect wrap-around: if column changed by more than 1, it's a wrap
+      let adjustedX = pixelX
       const cellSize = Math.min(window.innerWidth / MAZE_COLS, window.innerHeight / MAZE_ROWS)
-      const x = gridCol * cellSize + cellSize / 2
-      const y = gridRow * cellSize + cellSize / 2
+      const mazeWidth = cellSize * MAZE_COLS
       
-      socketService.updatePosition({ x, y })
-      lastPositionSentRef.current = { row: gridRow, col: gridCol }
+      if (hasWrapAround(currentGridPos.row)) {
+        const colDiff = currentGridPos.col - lastGridPos.col
+        
+        // Detect wrap from right to left (31 -> 0)
+        if (colDiff < -MAZE_COLS / 2 || (lastGridPos.col === MAZE_COLS - 1 && currentGridPos.col === 0)) {
+          // Player wrapped from right to left, adjust X to continue from right side
+          adjustedX = pixelX + mazeWidth
+        }
+        // Detect wrap from left to right (0 -> 31)
+        else if (colDiff > MAZE_COLS / 2 || (lastGridPos.col === 0 && currentGridPos.col === MAZE_COLS - 1)) {
+          // Player wrapped from left to right, adjust X to continue from left side
+          adjustedX = pixelX - mazeWidth
+        }
+      }
+      
+      socketService.updatePosition({ 
+        x: adjustedX, 
+        y: pixelY,
+        row: currentGridPos.row,
+        col: currentGridPos.col
+      })
+      lastPositionUpdateTimeRef.current = now
+      lastGridPosRef.current = { ...currentGridPos }
     }
   }
 
@@ -158,8 +311,11 @@ function StartGame() {
             break
         }
         
+        // Handle wrap-around for horizontal movement
+        const wrappedCheckCol = getWrappedCol(checkRow, checkCol)
+        
         // Only allow direction change if there's no wall
-        if (!isWall(checkRow, checkCol)) {
+        if (!isWall(checkRow, wrappedCheckCol)) {
           // Check if player is aligned with grid (at a turn point)
           const cellSize = Math.min(window.innerWidth / MAZE_COLS, window.innerHeight / MAZE_ROWS)
           const current = playerPixelPosRef.current
@@ -216,12 +372,13 @@ function StartGame() {
             return prevPos
         }
 
+        // Handle wrap-around for rows with 0s on both ends
+        const wrappedCol = getWrappedCol(newRow, newCol)
+        
         // Check if the new position is valid (not a wall)
-        if (!isWall(newRow, newCol)) {
-          targetGridPosRef.current = { row: newRow, col: newCol }
-          // Send position update to server
-          sendPositionUpdate(newRow, newCol)
-          return { row: newRow, col: newCol }
+        if (!isWall(newRow, wrappedCol)) {
+          targetGridPosRef.current = { row: newRow, col: wrappedCol }
+          return { row: newRow, col: wrappedCol }
         }
         // If it's a wall, stop moving (don't change position)
         return prevPos
@@ -255,7 +412,26 @@ function StartGame() {
       
       // Smooth interpolation with time-based movement
       const current = playerPixelPosRef.current
-      const dx = targetX - current.x
+      const currentRow = targetGridPosRef.current.row
+      const mazeWidth = cellSize * MAZE_COLS
+      
+      // Handle wrap-around for smooth animation
+      let adjustedTargetX = targetX
+      if (hasWrapAround(currentRow)) {
+        // Calculate distance both ways (normal and wrapped)
+        const dxNormal = targetX - current.x
+        const dxWrappedLeft = (targetX + mazeWidth) - current.x  // Target is to the right, wrap left
+        const dxWrappedRight = (targetX - mazeWidth) - current.x  // Target is to the left, wrap right
+        
+        // Choose the shortest path
+        if (Math.abs(dxWrappedLeft) < Math.abs(dxNormal) && targetX < current.x) {
+          adjustedTargetX = targetX + mazeWidth
+        } else if (Math.abs(dxWrappedRight) < Math.abs(dxNormal) && targetX > current.x) {
+          adjustedTargetX = targetX - mazeWidth
+        }
+      }
+      
+      const dx = adjustedTargetX - current.x
       const dy = targetY - current.y
       const distance = Math.sqrt(dx * dx + dy * dy)
       
@@ -273,10 +449,34 @@ function StartGame() {
           current.x += dx * ratio
           current.y += dy * ratio
         }
+        
+        // Handle wrap-around: normalize position after movement
+        if (hasWrapAround(currentRow)) {
+          // Normalize to 0-mazeWidth range
+          while (current.x < 0) {
+            current.x += mazeWidth
+          }
+          while (current.x >= mazeWidth) {
+            current.x -= mazeWidth
+          }
+        }
       } else {
         current.x = targetX
         current.y = targetY
+        
+        // Normalize position after snapping
+        if (hasWrapAround(currentRow)) {
+          while (current.x < 0) {
+            current.x += mazeWidth
+          }
+          while (current.x >= mazeWidth) {
+            current.x -= mazeWidth
+          }
+        }
       }
+      
+      // Send position update for local player (more frequently for smoother remote movement)
+      sendPositionUpdate(current.x, current.y)
       
       // Check if we have a pending direction change and player is now aligned
       if (pendingDirectionRef.current) {
@@ -289,6 +489,136 @@ function StartGame() {
           setDirection(pendingDirectionRef.current)
           pendingDirectionRef.current = null
         }
+      }
+      
+      // Smooth interpolation for remote players - update every frame for smooth movement
+      const updatedRemotePositions = {}
+      let needsUpdate = false
+      
+      Object.keys(remotePlayerPositionsRef.current).forEach(playerId => {
+        const playerPos = remotePlayerPositionsRef.current[playerId]
+        if (!playerPos) return
+        
+        const currentPos = playerPos.current
+        const targetPos = playerPos.target
+        const currentRow = playerPos.row
+        
+        // Handle wrap-around normalization for remote players
+        if (hasWrapAround(currentRow)) {
+          // Normalize current position to 0-mazeWidth range first
+          while (currentPos.x < 0) {
+            currentPos.x += mazeWidth
+          }
+          while (currentPos.x >= mazeWidth) {
+            currentPos.x -= mazeWidth
+          }
+          
+          // Normalize target position to 0-mazeWidth range
+          let normalizedTargetX = targetPos.x
+          while (normalizedTargetX < 0) {
+            normalizedTargetX += mazeWidth
+          }
+          while (normalizedTargetX >= mazeWidth) {
+            normalizedTargetX -= mazeWidth
+          }
+          
+          // Calculate distance both ways (normal and wrapped)
+          const dxNormal = normalizedTargetX - currentPos.x
+          const dxWrappedLeft = (normalizedTargetX + mazeWidth) - currentPos.x
+          const dxWrappedRight = (normalizedTargetX - mazeWidth) - currentPos.x
+          
+          // Choose the shortest path (but avoid paths that cross the entire screen)
+          // If the normal path is very long (> half screen), use wrapped path
+          let dx = dxNormal
+          if (Math.abs(dxNormal) > mazeWidth / 2) {
+            // Normal path is too long, use wrapped path
+            if (Math.abs(dxWrappedLeft) < Math.abs(dxWrappedRight)) {
+              dx = dxWrappedLeft
+            } else {
+              dx = dxWrappedRight
+            }
+          } else {
+            // Normal path is short, but check if wrapped is shorter
+            if (Math.abs(dxWrappedLeft) < Math.abs(dxNormal) && Math.abs(dxWrappedLeft) < mazeWidth / 2) {
+              dx = dxWrappedLeft
+            } else if (Math.abs(dxWrappedRight) < Math.abs(dxNormal) && Math.abs(dxWrappedRight) < mazeWidth / 2) {
+              dx = dxWrappedRight
+            }
+          }
+          
+          const dy = targetPos.y - currentPos.y
+          const distance = Math.sqrt(dx * dx + dy * dy)
+          
+          if (distance > 0.1) {
+            // Interpolate towards target at the same speed as local player
+            const pixelsPerMs = cellSize / moveSpeed
+            const moveAmount = pixelsPerMs * deltaTime
+            
+            if (moveAmount >= distance) {
+              currentPos.x = normalizedTargetX
+              currentPos.y = targetPos.y
+            } else {
+              const ratio = moveAmount / distance
+              currentPos.x += dx * ratio
+              currentPos.y += dy * ratio
+            }
+            
+            // Normalize after movement to keep in 0-mazeWidth range
+            while (currentPos.x < 0) {
+              currentPos.x += mazeWidth
+            }
+            while (currentPos.x >= mazeWidth) {
+              currentPos.x -= mazeWidth
+            }
+            
+            needsUpdate = true
+          } else {
+            currentPos.x = normalizedTargetX
+            currentPos.y = targetPos.y
+            needsUpdate = true
+          }
+        } else {
+          // No wrap-around, normal interpolation
+          const dx = targetPos.x - currentPos.x
+          const dy = targetPos.y - currentPos.y
+          const distance = Math.sqrt(dx * dx + dy * dy)
+          
+          if (distance > 0.1) {
+            // Interpolate towards target at the same speed as local player
+            const pixelsPerMs = cellSize / moveSpeed
+            const moveAmount = pixelsPerMs * deltaTime
+            
+            if (moveAmount >= distance) {
+              currentPos.x = targetPos.x
+              currentPos.y = targetPos.y
+            } else {
+              const ratio = moveAmount / distance
+              currentPos.x += dx * ratio
+              currentPos.y += dy * ratio
+            }
+            needsUpdate = true
+          } else if (distance > 0.01) {
+            // Very close, snap to target
+            currentPos.x = targetPos.x
+            currentPos.y = targetPos.y
+            needsUpdate = true
+          }
+        }
+        
+        // Always collect position for rendering
+        updatedRemotePositions[playerId] = { x: currentPos.x, y: currentPos.y }
+      })
+      
+      // Update state every frame for smooth rendering (React will batch these efficiently)
+      if (Object.keys(updatedRemotePositions).length > 0) {
+        // Use functional update to ensure we get the latest state
+        setRemotePlayerPixelPos(prev => {
+          const newState = { ...prev }
+          Object.keys(updatedRemotePositions).forEach(playerId => {
+            newState[playerId] = updatedRemotePositions[playerId]
+          })
+          return newState
+        })
       }
       
       // Update state for rendering
@@ -374,8 +704,10 @@ function StartGame() {
 
         {/* Remote Players */}
         {Object.entries(remotePlayers).map(([playerId, player]) => {
-          const remoteLeftPercent = (player.x / mazeWidth) * 100
-          const remoteTopPercent = (player.y / mazeHeight) * 100
+          // Use interpolated pixel position for smooth movement
+          const pixelPos = remotePlayerPixelPos[playerId] || { x: player.x, y: player.y }
+          const remoteLeftPercent = (pixelPos.x / mazeWidth) * 100
+          const remoteTopPercent = (pixelPos.y / mazeHeight) * 100
           
           return (
             <div key={playerId}>
