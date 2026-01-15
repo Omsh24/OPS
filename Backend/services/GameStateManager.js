@@ -8,11 +8,14 @@ import { GAME_CONFIG } from '../config/constants.js';
 
 class GameStateManager {
     constructor() {
-        // Store player positions: roomCode -> { playerId -> { x, y, timestamp, ... } }
+        // Store player positions: roomCode -> { playerId -> { x, y, timestamp, row, col, ... } }
         this.playerPositions = new Map();
         
         // Throttle tracking: socketId -> lastUpdateTime
         this.lastUpdateTime = new Map();
+        
+        // Track last grid positions for wrap-around detection: playerId -> { row, col }
+        this.lastGridPositions = new Map();
     }
 
     /**
@@ -62,16 +65,37 @@ class GameStateManager {
             return null; // Invalid position
         }
 
-        // Store position with timestamp
+        // Get last grid position for wrap detection
+        const lastGridPos = this.lastGridPositions.get(playerId) || { row: validatedPosition.row, col: validatedPosition.col };
+        const currentGridPos = { row: validatedPosition.row, col: validatedPosition.col };
+        
+        // Detect wrap-around: if row/col are provided and changed significantly, it's a wrap
+        // This helps remote clients detect wraps properly
+        let isWrap = false;
+        if (typeof validatedPosition.row === 'number' && typeof validatedPosition.col === 'number') {
+            const colDiff = validatedPosition.col - lastGridPos.col;
+            // Detect wrap: column jumps from high to low or low to high
+            if (Math.abs(colDiff) > 16) { // More than half the maze width (32/2 = 16)
+                isWrap = true;
+            }
+        }
+
+        // Store position with timestamp and wrap flag
         const positionState = {
             ...validatedPosition,
             playerId: playerId,
-            timestamp: now
+            timestamp: now,
+            isWrap: isWrap // Flag to help clients handle wrap smoothly
         };
 
         const roomPositions = this.playerPositions.get(roomCode);
         roomPositions.set(playerId, positionState);
         this.lastUpdateTime.set(playerId, now);
+        
+        // Update last grid position
+        if (typeof validatedPosition.row === 'number' && typeof validatedPosition.col === 'number') {
+            this.lastGridPositions.set(playerId, { row: validatedPosition.row, col: validatedPosition.col });
+        }
 
         return positionState;
     }
@@ -86,14 +110,24 @@ class GameStateManager {
             return null;
         }
 
-        const { x, y } = positionData;
+        const { x, y, row, col } = positionData;
         const { MIN_X, MAX_X, MIN_Y, MAX_Y } = GAME_CONFIG.POSITION_VALIDATION;
 
-        // Clamp position to valid range
+        // For wrap-around positions, don't clamp X values as they may be outside normal range
+        // The frontend sends adjusted X values for smooth wrap-around animation
+        // Only clamp Y values and validate X is a number
         const validated = {
-            x: Math.max(MIN_X, Math.min(MAX_X, x)),
+            x: x, // Preserve X value (may be outside normal range for wrap-around)
             y: Math.max(MIN_Y, Math.min(MAX_Y, y))
         };
+
+        // Preserve row and col if provided (needed for wrap-around detection)
+        if (typeof row === 'number') {
+            validated.row = row;
+        }
+        if (typeof col === 'number') {
+            validated.col = col;
+        }
 
         return validated;
     }
@@ -139,6 +173,7 @@ class GameStateManager {
             roomPositions.delete(playerId);
         }
         this.lastUpdateTime.delete(playerId);
+        this.lastGridPositions.delete(playerId);
     }
 
     /**
