@@ -29,7 +29,7 @@ export const SocketProvider = ({ children }) => {
   const [leaderboard, setLeaderboard] = useState([]);
 
   useEffect(() => {
-    // Connect to socket server
+    // Connect to socket server (will reuse existing connection if available)
     const socketInstance = socketService.connect();
     setSocket(socketInstance);
 
@@ -117,7 +117,7 @@ export const SocketProvider = ({ children }) => {
       }
     });
 
-    // Cleanup on unmount
+    // Cleanup on unmount - remove listeners only (keep connection alive)
     return () => {
       socketService.removeAllListeners('room_update');
       socketService.removeAllListeners('player_joined');

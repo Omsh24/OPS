@@ -11,16 +11,29 @@ class SocketService {
   constructor() {
     this.socket = null;
     this.connected = false;
+    this.connectionCount = 0; // Track connection attempts
   }
 
   /**
    * Connect to the Socket.IO server
    */
   connect() {
-    if (this.socket && this.connected) {
+    // If socket exists and is connected, return it
+    if (this.socket && this.socket.connected) {
       console.log('Socket already connected');
       return this.socket;
     }
+
+    // If socket exists but disconnected, try to reconnect existing socket
+    if (this.socket && !this.socket.connected) {
+      console.log('Reconnecting existing socket');
+      this.socket.connect();
+      return this.socket;
+    }
+
+    // Only create new socket if one doesn't exist
+    this.connectionCount++;
+    console.log(`Creating new socket connection (attempt ${this.connectionCount})`);
 
     this.socket = io(SOCKET_URL, {
       transports: ['websocket', 'polling'],
@@ -51,6 +64,7 @@ class SocketService {
    */
   disconnect() {
     if (this.socket) {
+      console.log('Disconnecting socket');
       this.socket.disconnect();
       this.socket = null;
       this.connected = false;
